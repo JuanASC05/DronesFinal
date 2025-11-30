@@ -1,0 +1,778 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import networkx as nx
+from math import radians, sin, cos, atan2, sqrt
+import folium
+from streamlit_folium import st_folium
+import json
+import requests
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# ========================== CONSTANTES ==========================
+ZONAS_RESTRINGIDAS = [
+    "San Borja", "San Isidro", "Cercado de Lima", "Miraflores", "Barranco",
+    "La Molina", "Santiago de Surco"
+]
+
+fallbacks = {
+    "San Borja": [[-12.0838, -76.9998], [-12.0839, -76.9903], [-12.0918, -76.9899], [-12.1039, -76.9811],
+                  [-12.1080, -76.9835], [-12.1140, -76.9898], [-12.1104, -76.9987], [-12.1019, -77.0038],
+                  [-12.0910, -77.0051], [-12.0840, -77.0015], [-12.0838, -76.9998]],
+    "San Isidro": [[-12.0858, -77.0370], [-12.0954, -77.0401], [-12.1020, -77.0363], [-12.1065, -77.0275],
+                   [-12.1086, -77.0200], [-12.1041, -77.0160], [-12.0958, -77.0152], [-12.0886, -77.0175],
+                   [-12.0853, -77.0259], [-12.0838, -77.0332], [-12.0858, -77.0370]],
+    "Cercado de Lima": [[-12.0300, -77.0500], [-12.0400, -77.0600], [-12.0500, -77.0700], [-12.0600, -77.0800],
+                        [-12.0700, -77.0900], [-12.0800, -77.1000], [-12.0900, -77.1100], [-12.1000, -77.1200],
+                        [-12.0300, -77.0500]],
+    "Miraflores": [[-12.1100, -77.0400], [-12.1200, -77.0300], [-12.1300, -77.0200], [-12.1400, -77.0100],
+                   [-12.1500, -77.0000], [-12.1600, -76.9900], [-12.1700, -76.9800], [-12.1800, -76.9700],
+                   [-12.1100, -77.0400]],
+    "Barranco": [[-12.1400, -77.0200], [-12.1500, -77.0100], [-12.1600, -77.0000], [-12.1700, -76.9900],
+                 [-12.1800, -76.9800], [-12.1900, -76.9700], [-12.2000, -76.9600], [-12.2100, -76.9500],
+                 [-12.1400, -77.0200]],
+    "La Molina": [[-12.0635, -77.0032], [-12.065, -76.995], [-12.072, -76.985], [-12.080, -76.970],
+                  [-12.088, -76.958], [-12.098, -76.945], [-12.112, -76.935], [-12.130, -76.922],
+                  [-12.150, -76.915], [-12.165, -76.920], [-12.165, -76.950], [-12.155, -76.980],
+                  [-12.145, -77.000], [-12.125, -77.005], [-12.100, -77.005], [-12.075, -77.000],
+                  [-12.0635, -77.0032]],
+    "Santiago de Surco": [
+        [-12.126386, -77.0026989],
+        [-12.1284408, -77.0012861],
+        [-12.126386, -77.0026989]
+    ]
+}
+
+with open("lima_government.geojson", "r", encoding="utf-8") as f:
+    gov_data = json.load(f)
+
+with open("lima_health.geojson", "r", encoding="utf-8") as f:
+    GEO_SALUD = json.load(f)
+
+# ========================== FUNCIONES AUXILIARES ==========================
+def point_in_polygon(x, y, poly):
+    n = len(poly)
+    inside = False
+    p1x, p1y = poly[0]
+    for i in range(n + 1):
+        p2x, p2y = poly[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+def is_in_district(lat, lon, polys):
+    if not polys:
+        return False
+    outer = polys[0]
+    inners = polys[1:]
+    in_outer = point_in_polygon(lon, lat, outer)
+    in_inners = any(point_in_polygon(lon, lat, inner) for inner in inners)
+    return in_outer and not in_inners
+
+def distancia_haversine(lat1, lon1, lat2, lon2):
+    radio_tierra = 6371
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    return 2 * radio_tierra * atan2(sqrt(a), sqrt(1-a))
+
+def is_in_zona_critica(lat, lon):
+    lat_penta = -12.100201829561424
+    lon_penta = -76.9868184334633
+    return distancia_haversine(lat, lon, lat_penta, lon_penta) <= 1.80
+
+def obtener_limites_distrito(nombre):
+    return fallbacks.get(nombre)
+
+def obtener_boundary_osm(distrito):
+    rel_ids = {
+        "San Borja": 1944802,
+        "San Isidro": 1944812,
+        "Cercado de Lima": 1944756,
+        "Miraflores": 1944770,
+        "Barranco": 1944691,
+        "La Molina": 1944745,
+        "Santiago de Surco": 1944798
+    }
+
+    # Si no hay ID para el distrito, devolver fallback (si existe)
+    if distrito not in rel_ids:
+        return [fallbacks.get(distrito)] if distrito in fallbacks else None
+
+    relation_id = rel_ids[distrito]
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:180];
+    relation({relation_id});
+    (._;>;);
+    out body;
+    """
+
+    try:
+        response = requests.post(overpass_url, data={'data': query}, timeout=30)
+        # Si falla la petición, usar fallback
+        if response.status_code != 200:
+            return [fallbacks.get(distrito)]
+
+        data = response.json()
+        if "elements" not in data:
+            return [fallbacks.get(distrito)]
+
+        # Mapear nodos y ways
+        nodes = {el["id"]: (el["lon"], el["lat"]) for el in data["elements"] if el["type"] == "node"}
+        ways = {el["id"]: el["nodes"] for el in data["elements"] if el["type"] == "way"}
+
+        # Buscar la relation
+        rels = [el for el in data["elements"] if el["type"] == "relation"]
+        if not rels:
+            return [fallbacks.get(distrito)]
+        rel = rels[0]
+
+        polys = []
+        # Construir anillos para roles 'outer' y 'inner'
+        for role in ['outer', 'inner']:
+            members = [m for m in rel.get("members", []) if m.get("role") == role and m.get("type") == "way"]
+            if not members:
+                continue
+
+            way_nodes = {m["ref"]: ways[m["ref"]] for m in members if m["ref"] in ways}
+            if not way_nodes:
+                continue
+
+            # Armado del ring
+            start_to_way = defaultdict(list)
+            end_to_way = defaultdict(list)
+            for w_id, nlist in way_nodes.items():
+                start_to_way[nlist[0]].append(w_id)
+                end_to_way[nlist[-1]].append(w_id)
+
+            current_way = list(way_nodes.keys())[0]
+            polygon_nodes = way_nodes[current_way][:]
+            used = {current_way}
+            current_end = polygon_nodes[-1]
+
+            while True:
+                next_way = None
+                reverse = False
+                # Buscar siguiente way que empiece por current_end
+                for w in start_to_way.get(current_end, []):
+                    if w not in used:
+                        next_way = w
+                        break
+                if not next_way:
+                    # Buscar way que termine en current_end (y hacer reverse)
+                    for w in end_to_way.get(current_end, []):
+                        if w not in used:
+                            next_way = w
+                            reverse = True
+                            break
+                if not next_way:
+                    break
+
+                used.add(next_way)
+                next_nodes = way_nodes[next_way][:]
+                if reverse:
+                    next_nodes = next_nodes[::-1]
+                polygon_nodes.extend(next_nodes[1:])
+                current_end = polygon_nodes[-1]
+
+            # Cerrar anillo si es necesario
+            if polygon_nodes and polygon_nodes[0] != polygon_nodes[-1]:
+                polygon_nodes.append(polygon_nodes[0])
+
+            # Convertir node ids a coordenadas (lat, lon)
+            coords = []
+            for node_id in polygon_nodes:
+                if node_id in nodes:
+                    lon, lat = nodes[node_id]
+                    coords.append([lat, lon])
+
+            # Agregar solo si hay coordenadas
+            if coords:
+                polys.append(coords)
+
+        # --- Validar polígonos: deben tener al menos 4 puntos (triángulo cerrado = 4) ---
+        polys_validos = [p for p in polys if p and len(p) >= 4]
+
+        # Si no hay polígonos válidos, retornar fallback (si existe)
+        # Para Surco, usar fallback sí o sí
+        if distrito == "Santiago de Surco":
+            return [fallbacks["Santiago de Surco"]]
+
+        if not polys_validos:
+            return [fallbacks.get(distrito)]
+
+        return polys_validos
+
+    except Exception as e:
+        try:
+            st.warning(f"obtener_boundary_osm({distrito}) fallback por excepción: {str(e)}")
+        except:
+            pass
+        return [fallbacks.get(distrito)]
+
+def agregar_zonas_restringidas(mapa):
+    # === CÍRCULO DEL PENTAGONITO (1.8 km) ===
+    # (si quieres agregar círculo, puedes hacerlo aquí; lo dejé fuera por claridad)
+
+    # === INSTALACIONES DE SALUD (generalmente puntos) ===
+    for feat in GEO_SALUD["features"]:
+        geom = feat["geometry"]
+        props = feat.get("properties", {})
+        name = props.get("name") or props.get("nombre") or props.get("NOMBRE") or "Instalación de Salud"
+        
+        if geom["type"] == "Point":
+            lon, lat = geom["coordinates"]
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=9,
+                color="#ff0000",
+                fill_color="#ff6666",
+                fill_opacity=0.8,
+                weight=2,
+                tooltip=name,
+                popup=folium.Popup(f"<b style='color:red'>{name}</b><br>Zona restringida - Salud", max_width=300)
+            ).add_to(mapa)
+        
+        elif geom["type"] in ["Polygon", "MultiPolygon"]:
+            poly_list = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+            for poly_rings in poly_list:
+                rings_latlng = []
+                for ring in poly_rings:
+                    ring_latlng = [[lat, lon] for lon, lat in ring]
+                    rings_latlng.append(ring_latlng)
+                
+                folium.Polygon(
+                    locations=rings_latlng,
+                    color="#ff0000",
+                    weight=2,
+                    fill=True,
+                    fill_color="#ff6666",
+                    fill_opacity=0.45,
+                    tooltip=name,
+                    popup=folium.Popup(f"<b style='color:red'>{name}</b><br>Zona restringida - Salud", max_width=300)
+                ).add_to(mapa)
+
+    # === EDIFICIOS GUBERNAMENTALES ===
+    for feat in gov_data["features"]:
+        geom = feat["geometry"]
+        props = feat.get("properties", {})
+        name = props.get("name") or props.get("nombre") or props.get("NOMBRE") or "Edificio Gubernamental"
+        
+        if geom["type"] == "Point":
+            lon, lat = geom["coordinates"]
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=11,
+                color="#8b0000",
+                fill_color="#dc143c",
+                fill_opacity=0.9,
+                weight=3,
+                tooltip=name,
+                popup=folium.Popup(f"<b style='color:#8b0000'>{name}</b><br>EDIFICIO GUBERNAMENTAL", max_width=300)
+            ).add_to(mapa)
+        
+        elif geom["type"] in ["Polygon", "MultiPolygon"]:
+            poly_list = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
+            for poly_rings in poly_list:
+                rings_latlng = []
+                for ring in poly_rings:
+                    ring_latlng = [[lat, lon] for lon, lat in ring]
+                    rings_latlng.append(ring_latlng)
+                
+                folium.Polygon(
+                    locations=rings_latlng,
+                    color="#8b0000",
+                    weight=4,
+                    fill=True,
+                    fill_color="#dc143c",
+                    fill_opacity=0.55,
+                    tooltip=name,
+                    popup=folium.Popup(f"<b style='color:#8b0000'>{name}</b><br>EDIFICIO GUBERNAMENTAL", max_width=300)
+                ).add_to(mapa)
+
+    # === DISTRITOS RESTRINGIDOS (fondo suave) ===
+    for distrito in ZONAS_RESTRINGIDAS:
+        polys = obtener_boundary_osm(distrito)
+        if polys:
+            for poly in polys:
+                folium.Polygon(
+                    locations=poly,
+                    color="#ff3333",
+                    weight=2,
+                    fill=True,
+                    fill_color="#ff3333",
+                    fill_opacity=0.18,
+                    tooltip=f"Distrito restringido: {distrito}"
+                ).add_to(mapa)
+   
+# ========================== FUNCIONES DE GRAFO ==========================
+def construir_grafo_knn(df, k=3):
+    G = nx.Graph()
+    coords = {}
+    for _, fila in df.iterrows():
+        ruc = str(fila["RUC"])
+        lat = float(fila["LATITUD"])
+        lon = float(fila["LONGITUD"])
+        G.add_node(ruc, nombre=fila["RAZON_SOCIAL"], lat=lat, lon=lon)
+        coords[ruc] = (lat, lon)
+    for nodo in coords:
+        distancias = []
+        for otro in coords:
+            if otro == nodo:
+                continue
+            d = distancia_haversine(coords[nodo][0], coords[nodo][1], coords[otro][0], coords[otro][1])
+            distancias.append((otro, d))
+        distancias.sort(key=lambda x: x[1])
+        for vecino, d in distancias[:k]:
+            G.add_edge(nodo, vecino, weight=d)
+    return G
+
+def construir_grafo_mst(df):
+    G_completo = nx.Graph()
+    coords = {}
+    for _, fila in df.iterrows():
+        ruc = str(fila["RUC"])
+        lat = float(fila["LATITUD"])
+        lon = float(fila["LONGITUD"])
+        G_completo.add_node(ruc, nombre=fila["RAZON_SOCIAL"], lat=lat, lon=lon)
+        coords[ruc] = (lat, lon)
+    nodos = list(coords.keys())
+    for i in range(len(nodos)):
+        for j in range(i+1, len(nodos)):
+            n1, n2 = nodos[i], nodos[j]
+            d = distancia_haversine(coords[n1][0], coords[n1][1], coords[n2][0], coords[n2][1])
+            G_completo.add_edge(n1, n2, weight=d)
+    return nx.minimum_spanning_tree(G_completo, weight="weight", algorithm="kruskal") 
+def dibujar_mapa_ruta_dron(G_base, camino, origen_ruc, destino_ruc):
+    """
+    Mapa Folium que muestra:
+      - Solo los nodos de la ruta + nodos prohibidos fuertes.
+      - Ruta en azul.
+      - Nodos prohibidos fuertes en naranja.
+      - Origen en verde, destino en azul, nodos intermedios en naranja.
+    """
+    if not camino:
+        return None
+
+    # Centro del mapa usando solo la ruta
+    lats = [G_base.nodes[n]["lat"] for n in camino if n in G_base.nodes]
+    lons = [G_base.nodes[n]["lon"] for n in camino if n in G_base.nodes]
+    if not lats or not lons:
+        return None
+
+    centro = [float(np.mean(lats)), float(np.mean(lons))]
+    m = folium.Map(location=centro, zoom_start=13, control_scale=True)
+
+    # --- Línea de la ruta (azul) ---
+    puntos = []
+    for n in camino:
+        if n in G_base.nodes:
+            puntos.append((G_base.nodes[n]["lat"], G_base.nodes[n]["lon"]))
+    folium.PolyLine(puntos, weight=4, color="blue", opacity=0.85).add_to(m)
+
+    # --- Nodos prohibidos fuertes (según distrito) ---
+    nodos_prohibidos = [
+        n for n, data in G_base.nodes(data=True)
+        if data.get("distrito", "").upper() in {"CALLAO","SAN ISIDRO","SAN BORJA","MIRAFLORES","SANTIAGO DE SURCO","SURCO"}
+    ]
+
+    # --- Nodos a mostrar: ruta + prohibidos ---
+    nodos_mostrar = set(camino) | set(nodos_prohibidos)
+
+    for n in nodos_mostrar:
+        if n not in G_base.nodes:
+            continue
+        data = G_base.nodes[n]
+        lat, lon = data["lat"], data["lon"]
+        dist = data.get("distrito", "")
+        nombre = data.get("nombre", "")
+
+        # Colores según tipo de nodo
+        if n in nodos_prohibidos:
+            fill = "#FF7F00"       # naranja fuerte para zonas prohibidas
+        elif n == origen_ruc:
+            fill = "green"         # origen
+        elif n == destino_ruc:
+            fill = "blue"          # destino
+        elif n in camino:
+            fill = "orange"        # parte de la ruta
+        else:
+            fill = "#8FEAF3"       # nodo normal
+
+        popup = f"<b>{nombre}</b><br>RUC: {n}<br>Distrito: {dist}"
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=6,
+            color="black",
+            weight=0.8,
+            fill=True,
+            fill_opacity=0.95,
+            fill_color=fill,
+        ).add_to(m).add_child(folium.Popup(popup, max_width=300))
+
+    return m
+
+def norm_distrito(d):
+    if d is None:
+        return "SIN_DISTRITO"
+    return str(d).strip().upper()
+
+PROHIBIDOS_FUERTES = {
+    "CALLAO",
+    "SAN ISIDRO",
+    "SAN BORJA",
+    "MIRAFLORES",
+    "SANTIAGO DE SURCO",
+    "SURCO",
+}
+
+RESTRICCION_PARCIAL = {
+    "BARRANCO",
+    "LA MOLINA",
+    "VILLA EL SALVADOR",
+    "VES",
+    "VILLA MARIA DEL TRIUNFO",
+    "VMT",
+    "LURIN",
+    "PACHACAMAC",
+}
+
+PENALIZACION_PARCIAL_KM = 20.0
+PENALIZACION_FUERTE_KM  = 200.0
+
+def construir_grafo_dron(df, k_vecinos=4):
+    df_loc = df.copy()
+    if "DISTRITO" in df_loc.columns:
+        df_loc["DIST_NORM"] = df_loc["DISTRITO"].apply(norm_distrito)
+    else:
+        df_loc["DIST_NORM"] = "SIN_DISTRITO"
+
+    G = nx.Graph()
+    coords = {}
+    distritos = {}
+
+    for _, row in df_loc.iterrows():
+        ruc = str(row["RUC"])
+        lat = float(row["LATITUD"])
+        lon = float(row["LONGITUD"])
+        dist = row.get("DIST_NORM", "SIN_DISTRITO")
+        name = row.get("RAZON_SOCIAL", "")
+        G.add_node(ruc, nombre=name, lat=lat, lon=lon, distrito=dist)
+        coords[ruc] = (lat, lon)
+        distritos[ruc] = dist
+
+    rucs = list(coords.keys())
+
+    for u in rucs:
+        lat_u, lon_u = coords[u]
+        dist_list = []
+        for v in rucs:
+            if v == u:
+                continue
+            lat_v, lon_v = coords[v]
+            d = distancia_haversine(lat_u, lon_u, lat_v, lon_v)
+
+            extra = 0.0
+            du, dv = distritos[u], distritos[v]
+
+            if du in RESTRICCION_PARCIAL or dv in RESTRICCION_PARCIAL:
+                extra += PENALIZACION_PARCIAL_KM
+
+            if du in PROHIBIDOS_FUERTES or dv in PROHIBIDOS_FUERTES:
+                extra += PENALIZACION_FUERTE_KM
+
+            dist_list.append((v, d + extra))
+
+        dist_list.sort(key=lambda x: x[1])
+        for v, w in dist_list[:k_vecinos]:
+            if not G.has_edge(u, v):
+                G.add_edge(u, v, weight=w)
+
+    return G
+
+def bellman_ford(nodes, edges, origen):
+    INF = float("inf")
+    dist = {n: INF for n in nodes}
+    padre = {n: None for n in nodes}
+    dist[origen] = 0.0
+
+    for _ in range(len(nodes) - 1):
+        hubo_cambio = False
+        for u, v, w in edges:
+            if dist[u] + w < dist[v]:
+                dist[v] = dist[u] + w
+                padre[v] = u
+                hubo_cambio = True
+        if not hubo_cambio:
+            break
+
+    return dist, padre
+
+def camino_bellman_ford(G, origen, destino):
+    nodes = list(G.nodes())
+    edges = []
+
+    for u, v, data in G.edges(data=True):
+        w = float(data.get("weight", 1.0))
+        edges.append((u, v, w))
+        edges.append((v, u, w))
+
+    dist, padre = bellman_ford(nodes, edges, origen)
+
+    if dist.get(destino, float("inf")) == float("inf"):
+        return None, None
+
+    camino = []
+    actual = destino
+    while actual is not None:
+        camino.append(actual)
+        actual = padre.get(actual)
+    camino.reverse()
+    return camino, dist[destino]
+
+def calcular_ruta_dijkstra(G, origen, destino):
+    try:
+        camino = nx.shortest_path(G, source=origen, target=destino, weight="weight")
+        longitud = nx.shortest_path_length(G, source=origen, target=destino, weight="weight")
+        return camino, longitud
+    except nx.NetworkXNoPath:
+        return None, None
+
+# ==========================
+# Configuración de Streamlit
+# ==========================
+st.set_page_config(page_title="Optimizador Logístico Courier", layout="wide")
+st.title("📦 Optimizador Logístico Courier con Grafos")
+
+st.sidebar.header("⚙️ Configuración del aplicativo")
+
+tipo_grafo = st.sidebar.selectbox(
+    "Tipo de grafo",
+    ["k-NN", "MST"],
+    key="sb_tipo_grafo"
+)
+
+k_vecinos = st.sidebar.slider(
+    "k vecinos (solo k-NN)",
+    min_value=1,
+    max_value=6,
+    value=3,
+    step=1,
+    key="sb_k_vecinos"
+)
+
+submuestro = st.sidebar.checkbox(
+    "Usar submuestreo visual",
+    value=True,
+    key="sb_submuestreo"
+)
+
+n_max = st.sidebar.slider(
+    "Máx. nodos a visualizar",
+    min_value=100,
+    max_value=1500,
+    value=400,
+    step=100,
+    key="sb_n_max"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Análisis disponibles")
+activar_ruta = st.sidebar.checkbox("Ruta óptima (Bellman-Ford)", key="sb_ruta")
+activar_hubs = st.sidebar.checkbox("Hubs (betweenness)", key="sb_hubs")
+activar_falla = st.sidebar.checkbox("Simulación de falla", key="sb_falla")
+activar_drones = st.sidebar.checkbox("Escenario con drones", key="sb_drones")
+
+# ==========================
+# Lógica principal
+# ==========================
+DATA_PATH = "DataBase.xlsx"
+try:
+    df = pd.read_excel(DATA_PATH)
+except FileNotFoundError:
+    st.error(f"No se encontró el archivo {DATA_PATH}.")
+    st.stop()
+
+df = df[["RUC", "RAZON_SOCIAL", "LATITUD", "LONGITUD"]].copy()
+df["RUC"] = df["RUC"].astype(str).str.strip()
+for col in ["LATITUD", "LONGITUD"]:
+    df[col] = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+df = df.dropna(subset=["LATITUD", "LONGITUD"])
+df["LATITUD"] = df["LATITUD"].astype(float)
+df["LONGITUD"] = df["LONGITUD"].astype(float)
+df = df.drop_duplicates(subset=["RUC"]).reset_index(drop=True)
+st.success(f"Datos cargados correctamente. Registros válidos: {len(df)}")
+
+df_vis = df.sample(n_max, random_state=42).reset_index(drop=True) if submuestro and len(df) > n_max else df.copy()
+df_vis["NOMBRE_EMPRESA"] = df_vis["RAZON_SOCIAL"].astype(str)
+emp_a_ruc = dict(zip(df_vis["NOMBRE_EMPRESA"], df_vis["RUC"]))
+
+if tipo_grafo == "k-NN":
+    G = construir_grafo_knn(df_vis, k=k_vecinos)
+else:
+    G = construir_grafo_mst(df_vis)
+
+tab_dataset, tab_grafo, tab_mapa, tab_rutas, tab_hubs, tab_fallas, tab_drones = st.tabs(
+    ["📄 Dataset", "🕸 Grafo", "🗺 Mapa", "🧭 Rutas", "⭐ Hubs", "⚠️ Fallas", "🚁 Drones"]
+)
+
+with tab_dataset:
+    st.subheader("Vista del dataset")
+    st.dataframe(df.head(20))
+    st.write(f"Total de nodos (RUC únicos): {df['RUC'].nunique()}")
+
+with tab_grafo:
+    st.subheader("Grafo (vista abstracta)")
+    st.pyplot(dibujar_grafo_spring(G))
+
+with tab_mapa:
+    st.subheader("Grafo georreferenciado")
+    mapa = dibujar_mapa_folium(G, dibujar_aristas=False)
+    if mapa:
+        st_folium(mapa, width=900, height=600)
+
+with tab_rutas:
+    st.subheader("Cálculo de ruta óptima (Bellman-Ford)")
+    if activar_ruta and G.number_of_nodes() >= 2:
+        opciones_empresas = sorted(df_vis["NOMBRE_EMPRESA"].unique())
+        col1, col2 = st.columns(2)
+        with col1:
+            origen_nombre = st.selectbox("Empresa origen", opciones_empresas, key="ruta_origen")
+        with col2:
+            destino_nombre = st.selectbox("Empresa destino", [e for e in opciones_empresas if e != origen_nombre], key="ruta_destino")
+        origen_ruc = str(emp_a_ruc[origen_nombre])
+        destino_ruc = str(emp_a_ruc[destino_nombre])
+        if st.button("Calcular ruta"):
+            camino, dist_km = camino_bellman_ford(G, origen_ruc, destino_ruc)
+            uso_fallback = False
+
+            if not camino:
+                uso_fallback = True
+                lat_o, lon_o = float(df[df["RUC"].astype(str) == origen_ruc]["LATITUD"].iloc[0]), float(df[df["RUC"].astype(str) == origen_ruc]["LONGITUD"].iloc[0])
+                lat_d, lon_d = float(df[df["RUC"].astype(str) == destino_ruc]["LATITUD"].iloc[0]), float(df[df["RUC"].astype(str) == destino_ruc]["LONGITUD"].iloc[0])
+                dist_km = distancia_haversine(lat_o, lon_o, lat_d, lon_d)
+                camino = [origen_ruc, destino_ruc]
+
+            st.session_state.update({"origen_ruc": origen_ruc, "destino_ruc": destino_ruc, "camino": camino})
+
+            if uso_fallback:
+                st.info(
+                    "La red no tenía un camino conectado entre estas empresas. "
+                    "Se muestra una conexión directa aproximada (fallback)."
+                )
+            else:
+                st.success(f"Ruta encontrada (Bellman-Ford). Distancia aproximada: {dist_km:.2f} km")
+
+            info_origen = df[df["RUC"].astype(str) == origen_ruc].iloc[0]
+            info_destino = df[df["RUC"].astype(str) == destino_ruc].iloc[0]
+
+            col_o, col_d = st.columns(2)
+            with col_o:
+                st.markdown("### 🟢 Origen")
+                st.write(f"**Empresa:** {info_origen['RAZON_SOCIAL']}")
+                st.write(f"**RUC:** {info_origen['RUC']}")
+                st.write(f"**Coordenadas:** ({info_origen['LATITUD']:.5f}, {info_origen['LONGITUD']:.5f})")
+            with col_d:
+                st.markdown("### 🔵 Destino")
+                st.write(f"**Empresa:** {info_destino['RAZON_SOCIAL']}")
+                st.write(f"**RUC:** {info_destino['RUC']}")
+                st.write(f"**Coordenadas:** ({info_destino['LATITUD']:.5f}, {info_destino['LONGITUD']:.5f})")
+
+            st.markdown("#### Ruta (secuencia de nodos)")
+            st.write(" → ".join(camino))
+            st_folium(dibujar_mapa_folium(G, camino=camino, solo_ruta=True), width=900, height=600)
+    else:
+        st.info("Activa 'Ruta óptima (Bellman-Ford)' en la barra lateral.")
+
+with tab_hubs:
+    if activar_hubs and G.number_of_nodes() > 0:
+        bc = nx.betweenness_centrality(G, weight="weight", normalized=True)
+        df_bc = pd.DataFrame([{"RUC": n, "Razon_Social": G.nodes[n].get("nombre", ""), "Betweenness": v} for n, v in bc.items()])
+        df_bc = df_bc.sort_values("Betweenness", ascending=False).head(10)
+        st.write("Top 10 nodos por betweenness:")
+        st.dataframe(df_bc)
+    else:
+        st.info("Activa 'Hubs (betweenness)' en la barra lateral.")
+
+with tab_fallas:
+    st.subheader("Simulación de falla + Zonas restringidas")
+    if not activar_falla:
+        st.info("Activa 'Simulación de falla' en la barra lateral.")
+        st.stop()
+    if "camino" not in st.session_state or st.session_state["camino"] is None:
+        st.warning("Primero calcula una ruta en el tab 'Rutas'.")
+        st.stop()
+    if st.button("Simular falla", key="simular_falla_unica"):
+        polys_dict = {d: obtener_boundary_osm(d) for d in ZONAS_RESTRINGIDAS}
+        victima = st.session_state["origen_ruc"]
+        G_fail = G.copy()
+        G_fail.remove_node(victima) if victima in G_fail else None
+        centro = [np.mean([G.nodes[n]["lat"] for n in G_fail.nodes]), np.mean([G.nodes[n]["lon"] for n in G_fail.nodes])]
+        mapa_falla = folium.Map(location=centro, zoom_start=13, tiles="cartodbpositron")
+        agregar_zonas_restringidas(mapa_falla)
+        for u, v in G_fail.edges():
+            folium.PolyLine(
+                [(G.nodes[u]["lat"], G.nodes[u]["lon"]), (G.nodes[v]["lat"], G.nodes[v]["lon"])],
+                weight=2, color="gray", opacity=0.7
+            ).add_to(mapa_falla)
+        for n in G_fail.nodes:
+            attr = G.nodes[n]
+            lat, lon = attr["lat"], attr["lon"]
+            popup = f"<b>{attr.get('nombre', '')}</b><br>RUC: {n}"
+            en_critica = is_in_zona_critica(lat, lon)
+            en_distrito = any(is_in_district(lat, lon, polys) for polys in polys_dict.values() if polys)
+            if en_critica or en_distrito:
+                fill = "#ff0000" if en_critica else "#cc0000"
+                radius = 8 if en_critica else 6
+                popup += "<br><b>⚠️ ZONA RESTRINGIDA" + (" CRÍTICA - PENTAGONITO" if en_critica else "") + "</b>"
+            else:
+                fill = "#8FEAF3"
+                radius = 5
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=radius,
+                fill=True,
+                color="black",
+                fill_color=fill,
+                fill_opacity=0.95,
+                weight=2 if en_critica else 1
+            ).add_to(mapa_falla).add_child(folium.Popup(popup, max_width=300))
+        for ruc, color, label in [(st.session_state["origen_ruc"], "green", "Origen"), (st.session_state["destino_ruc"], "blue", "Destino")]:
+            attr = G.nodes[ruc]
+            popup = f"<b>{attr.get('nombre', '')}</b><br>RUC: {ruc}<br>{label}"
+            en_critica = is_in_zona_critica(attr["lat"], attr["lon"])
+            en_restringida = any(is_in_district(attr["lat"], attr["lon"], polys) for polys in polys_dict.values() if polys)
+            if en_critica:
+                popup += "<br><b>⚠️ ZONA CRÍTICA PENTAGONITO</b>"
+            elif en_restringida:
+                popup += "<br><b>⚠️ ZONA RESTRINGIDA</b>"
+            folium.CircleMarker(
+                location=[attr["lat"], attr["lon"]],
+                radius=10,
+                fill=True,
+                color="black",
+                fill_color=color,
+                fill_opacity=1.0,
+                weight=3
+            ).add_to(mapa_falla).add_child(folium.Popup(popup, max_width=300))
+        puntos_ruta = [(G.nodes[r]["lat"], G.nodes[r]["lon"]) for r in st.session_state["camino"] if r in G_fail]
+        if len(puntos_ruta) >= 2:
+            folium.PolyLine(puntos_ruta, weight=8, color="#ff0000", opacity=1.0).add_to(mapa_falla)
+        st_folium(mapa_falla, width=1100, height=750)
+
+with tab_drones:
+    st.subheader("Escenario de uso de drones")
+    if not activar_drones:
+        st.info("Activa 'Escenario con drones' en la barra lateral.")
+    else:
+        st.write("Aquí puedes estimar energía, autonomía y comparar rutas con vs sin dron.")
+        st.markdown("- Ejemplo: consumo base 15 Wh/km + 1.2 Wh/km·kg por carga.")
+        st.markdown("- Autonomía estimada: distancia máxima antes de recarga.")
