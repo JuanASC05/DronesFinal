@@ -216,7 +216,114 @@ def obtener_boundary_osm(distrito):
         except:
             pass
         return [fallbacks.get(distrito)]
+        
+def dibujar_grafo_spring(G):
+    """
+    Dibujo abstracto del grafo con NetworkX.
+    Usamos circular_layout para evitar cualquier dependencia con scipy.
+    """
+    import matplotlib.pyplot as plt
 
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    if G.number_of_nodes() > 0:
+        # <<< CAMBIO CLAVE: layout que NO usa scipy >>>
+        pos = nx.circular_layout(G)
+    else:
+        pos = {}
+
+    nx.draw(
+        G,
+        pos,
+        node_size=20,
+        node_color="skyblue",
+        edge_color="gray",
+        with_labels=False,
+        ax=ax,
+    )
+    ax.set_title(f"Grafo – {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
+    ax.axis("off")
+    return fig
+
+
+
+def dibujar_mapa_folium(G, camino=None, solo_ruta=False):
+    """
+    Mapa Folium con nodos y aristas.
+    - si solo_ruta=False: muestra toda la red y resalta la ruta (si existe).
+    - si solo_ruta=True: solo muestra los nodos y aristas de la ruta.
+    """
+    if G.number_of_nodes() == 0:
+        return None
+
+    # --- Qué nodos usar para centrar el mapa ---
+    if solo_ruta and camino and len(camino) >= 1:
+        nodos_centro = camino
+    else:
+        nodos_centro = list(G.nodes)
+
+    lats = [G.nodes[n]["lat"] for n in nodos_centro]
+    lons = [G.nodes[n]["lon"] for n in nodos_centro]
+    centro = [np.mean(lats), np.mean(lons)]
+
+    m = folium.Map(location=centro, zoom_start=12, control_scale=True)
+
+    # --- Dibujo de aristas ---
+    if solo_ruta:
+        # Solo segmentos consecutivos de la ruta
+        if camino and len(camino) >= 2:
+            puntos = []
+            for u, v in zip(camino[:-1], camino[1:]):
+                lat1, lon1 = G.nodes[u]["lat"], G.nodes[u]["lon"]
+                lat2, lon2 = G.nodes[v]["lat"], G.nodes[v]["lon"]
+                folium.PolyLine(
+                    [(lat1, lon1), (lat2, lon2)],
+                    weight=4, color="red", opacity=0.9
+                ).add_to(m)
+    else:
+        # Toda la red en gris
+        for u, v, data in G.edges(data=True):
+            lat1, lon1 = G.nodes[u]["lat"], G.nodes[u]["lon"]
+            lat2, lon2 = G.nodes[v]["lat"], G.nodes[v]["lon"]
+            folium.PolyLine(
+                [(lat1, lon1), (lat2, lon2)],
+                weight=2, opacity=0.5, color="gray"
+            ).add_to(m)
+
+    # --- Dibujo de nodos ---
+    if solo_ruta and camino:
+        nodos_a_mostrar = camino
+    else:
+        nodos_a_mostrar = list(G.nodes)
+
+    for idx, n in enumerate(nodos_a_mostrar):
+        attr = G.nodes[n]
+        popup = f"<b>{attr.get('nombre','')}</b><br>RUC: {n}"
+        # Origen y destino con color distinto
+        if solo_ruta and camino:
+            if n == camino[0]:
+                fill = "green"
+            elif n == camino[-1]:
+                fill = "blue"
+            else:
+                fill = "#8FEAF3"
+        else:
+            fill = "#8FEAF3"
+
+        folium.CircleMarker(
+            location=[attr["lat"], attr["lon"]],
+            radius=5, fill=True, fill_opacity=0.95,
+            color="black", weight=0.7, fill_color=fill
+        ).add_to(m).add_child(folium.Popup(popup, max_width=250))
+
+    # Si no es solo_ruta pero hay camino, añadimos polyline roja encima
+    if (not solo_ruta) and camino and len(camino) >= 2:
+        puntos = [(G.nodes[r]["lat"], G.nodes[r]["lon"]) for r in camino]
+        folium.PolyLine(
+            puntos, weight=5, color="red", opacity=0.9
+        ).add_to(m)
+
+    return m
 def agregar_zonas_restringidas(mapa):
     # === CÍRCULO DEL PENTAGONITO (1.8 km) ===
     # (si quieres agregar círculo, puedes hacerlo aquí; lo dejé fuera por claridad)
@@ -776,3 +883,4 @@ with tab_drones:
         st.write("Aquí puedes estimar energía, autonomía y comparar rutas con vs sin dron.")
         st.markdown("- Ejemplo: consumo base 15 Wh/km + 1.2 Wh/km·kg por carga.")
         st.markdown("- Autonomía estimada: distancia máxima antes de recarga.")
+
